@@ -1,0 +1,18 @@
+{
+  "kind": "factor",
+  "environment": {"lockfile": "/shared/runs/run-001/environment/uv.lock"},
+  "factor": {
+    "package": "solo-factor-demo",
+    "version": "1.0.0",
+    "wheel": "https://<bucket>/packages/solo_factor_demo-1.0.0-py3-none-any.whl",
+    "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "entry": "solo_factor_demo:Factor",
+    "params": {}
+  },
+  "analysis": {
+    "start": "2025-01-01", "end": "2026-01-01",
+    "columns": ["momentum"], "return_periods": [1, 5, 20],
+    "groups": 5, "n_select": 10, "weight": "equal", "calendar_symbol": "000300.XSHG"
+  },
+  "output": "/shared/runs/run-001/report"
+}

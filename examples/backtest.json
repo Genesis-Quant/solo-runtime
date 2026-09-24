@@ -1,0 +1,23 @@
+{
+  "kind": "backtest",
+  "environment": {"lockfile": "/shared/runs/run-002/environment/uv.lock"},
+  "algos": {
+    "model": {
+      "package": "solo-model-demo", "version": "1.0.0",
+      "wheel": "https://<bucket>/packages/solo_model_demo-1.0.0-py3-none-any.whl",
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "entry": "solo_model_demo:ModelAlgo"
+    },
+    "optimize": null,
+    "execution": null,
+    "control": null
+  },
+  "context": "solo_model_demo:Context",
+  "backtest": {
+    "start": "2025-01-01", "end": "2026-01-01",
+    "market_data": "stock_daily", "symbols": ["000001.XSHE", "600000.XSHG"],
+    "benchmark": "000300.XSHG", "batch_days": 1,
+    "config": {"cash": 1000000.0, "commission": 0.0003, "tax": 0.0005}
+  },
+  "output": "/shared/runs/run-002/report"
+}
