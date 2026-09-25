@@ -58,7 +58,8 @@ def run(input_file: Path) -> int:
     input_sha256 = hashlib.sha256(source).hexdigest()
     lock_sha256 = file_hash(project_lock)
     env = dict(os.environ, UV_PROJECT_ENVIRONMENT=str(project / ".venv"))
-    for key in ("VIRTUAL_ENV", "PYTHONPATH", "PYTHONHOME"):
+    # Worker 的全局镜像设置不能覆盖任务锁文件所使用的索引。
+    for key in ("VIRTUAL_ENV", "PYTHONPATH", "PYTHONHOME", "UV_DEFAULT_INDEX", "UV_INDEX_URL", "UV_INDEX", "UV_EXTRA_INDEX_URL"):
         env.pop(key, None)
     result = subprocess.run(
         ["uv", "sync", "--project", str(project), "--locked", "--no-editable", "--no-dev"],

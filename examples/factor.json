@@ -2,11 +2,11 @@
   "kind": "factor",
   "environment": {"lockfile": "/shared/runs/run-001/environment/uv.lock"},
   "factor": {
-    "package": "solo-factor-demo",
+    "package": "factor-demo",
     "version": "1.0.0",
-    "wheel": "https://<bucket>/packages/solo_factor_demo-1.0.0-py3-none-any.whl",
+    "wheel": "https://<bucket>/packages/factor_demo-1.0.0-py3-none-any.whl",
     "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
-    "entry": "solo_factor_demo:Factor",
+    "entry": "factor_demo:Factor",
     "params": {}
   },
   "analysis": {

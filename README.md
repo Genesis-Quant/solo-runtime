@@ -40,4 +40,4 @@ Runtime 只读取 input.json 的两个字段，其他内容原样交给研究进
 
 scheme 在所有报告保存完成后原子写入 `run.json`。缺少清单、缺失文件、哈希不符或文件越出输出目录都视为失败；已有完成清单的目录禁止重跑覆盖。清单可额外包含研究参数、实际包版本等信息，Runtime 不解释这些字段，也不规定具体报告表结构。
 
-同一 Runtime 可以启动不同 scheme 主版本的任务，前提是它们实现相同 CLI 和完成清单协议。更改此进程边界协议才需要调整 Runtime。Jupyter 的研究 SDK 已迁入 `scheme.apps`、`scheme.data`，详见 [scheme README](https://github.com/Genesis-Quant/solo-algo-scheme#readme)。
+同一 Runtime 可以启动不同 scheme 主版本的任务，前提是它们实现相同 CLI 和完成清单协议。更改此进程边界协议才需要调整 Runtime。Jupyter 的研究 SDK 位于 `scheme.base`、`scheme.execute`、`scheme.data`，详见 [scheme README](https://gitee.com/genesis-quant/solo-algo-scheme#readme)。
