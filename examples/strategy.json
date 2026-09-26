@@ -1,5 +1,5 @@
 {
-  "kind": "backtest",
+  "kind": "strategy",
   "environment": {"lockfile": "/shared/runs/run-002/environment/uv.lock"},
   "algos": {
     "model": {
