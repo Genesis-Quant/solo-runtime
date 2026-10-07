@@ -4,12 +4,12 @@ Runtime 的 apps 与 DolphinScheduler 任务一一对应。各 app 使用锁定�
 
 ```shell
 uv sync
-uv run solo-manage apps factor --input-file /shared/runs/123/input.json
-uv run solo-manage apps model --input-file /shared/runs/456/input.json
-uv run solo-manage apps optimize --input-file /shared/runs/457/input.json
-uv run solo-manage apps control --input-file /shared/runs/458/input.json
-uv run solo-manage apps execution --input-file /shared/runs/459/input.json
-uv run solo-manage apps strategy --input-file /shared/runs/789/input.json
+uv run solo-manage apps factor --input-file /shared/runs/<run-uuid>/input.json
+uv run solo-manage apps model --input-file /shared/runs/<run-uuid>/input.json
+uv run solo-manage apps optimize --input-file /shared/runs/<run-uuid>/input.json
+uv run solo-manage apps control --input-file /shared/runs/<run-uuid>/input.json
+uv run solo-manage apps execution --input-file /shared/runs/<run-uuid>/input.json
+uv run solo-manage apps strategy --input-file /shared/runs/<run-uuid>/input.json
 ```
 
 每个任务准备独立的 `environment/pyproject.toml` 和 `environment/uv.lock`。研究包及其 scheme 依赖由锁文件选择，任务环境不需要安装 solo-runtime。正式锁文件只能引用发布包、wheel 或固定 Git 版本，不能引用可变源码目录。
@@ -33,10 +33,13 @@ Runtime 随后读取以下启动字段，其余内容原样交给研究进程：
 
 执行流程：
 
-1. 执行 `uv sync --project <environment> --locked --no-editable --no-dev`。
-2. 使用该环境的 `scheme run --input <input.json> --output <output>` 入口。不会退回使用 Worker 全局安装的命令。
-3. 子进程标准输出、标准错误直接交给 DolphinScheduler；安装失败和研究失败均返回非零退出码。
-4. 子进程成功退出后，核验 `run.json` 和它引用的所有报告文件。
+1. 从 `input.json` 的父目录读取 Backend 管理的 Run UUID，计算原始输入和 `uv.lock` 的 SHA256；向 `POST /api/v1/version-policy/tasks/{UUID}/check` 提交 `kind` 与两个哈希，成功后再次检查文件未变化。
+2. 仅在中央准入允许后执行 `uv sync --project <environment> --locked --no-editable --no-dev`。退役、来源不明、未持久化接受哈希的任务、任意克隆的旧输入、请求与数据库/文件哈希不符或 Backend 不可用时在安装环境前失败；不从 `created_at` 或 `queued` 推断例外。
+3. 使用该环境的 `scheme run --input <input.json> --output <output>` 入口。不会退回使用 Worker 全局安装的命令。
+4. 子进程标准输出、标准错误直接交给 DolphinScheduler；安装失败和研究失败均返回非零退出码。
+5. 子进程成功退出后，核验 `run.json` 和它引用的所有报告文件。
+
+Runtime 1.1.0 新增中央执行准入，完成协议仍为 1。通过 `SOLO_BACKEND_URL` 指定 Backend，默认 `http://backend:8000`；HTTP 有界超时并在错误中脱敏，政策不在 Worker 复制。历史报告读取不经过执行准入，已开始的进程不主动停止。
 
 协议版本 1 的完成清单字段：
 
