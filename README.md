@@ -29,7 +29,7 @@ Runtime 随后读取以下启动字段，其余内容原样交给研究进程：
 }
 ```
 
-相对路径以 input.json 所在目录为基准。完整因子、策略组装输入见 [factor.json](examples/factor.json)、[strategy.json](examples/strategy.json)，研究字段由任务所安装的 scheme 解释。
+相对路径以 input.json 所在目录为基准。研究字段由任务所安装的 scheme 参数模型定义和解释。
 
 执行流程：
 

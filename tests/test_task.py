@@ -1,9 +1,12 @@
+import builtins
 import hashlib
 import io
 import json
 import os
+import shutil
 import traceback
 import urllib.error
+import zipfile
 from http.client import HTTPException
 from pathlib import Path
 from types import SimpleNamespace
@@ -11,7 +14,6 @@ from unittest.mock import MagicMock, Mock
 from uuid import uuid4
 
 import pytest
-
 from solo_runtime.manage import main
 from solo_runtime.utils import task
 
@@ -74,7 +76,87 @@ def assert_not_started(calls, input_file):
     assert not (input_file.parent / "report").exists()
 
 
-def mock_task_processes(calls, input_file, *, events=None, after_run=None, returncodes=(0, 0)):
+def artifact_response(artifacts, *, grandfathered=False):
+    return json.dumps({
+        "allowed": True, "grandfathered": grandfathered, "artifacts": artifacts,
+    }).encode()
+
+
+def add_lock_package(input_file, *, name, version, source, wheels=None):
+    def inline_table(values):
+        return "{ " + ", ".join(f"{key} = {json.dumps(value)}" for key, value in values.items()) + " }"
+
+    package = (
+        f"\n[[package]]\nname = {json.dumps(name)}\nversion = {json.dumps(version)}\n"
+        f"source = {inline_table(source)}\n"
+    )
+    if wheels is not None:
+        package += "wheels = [" + ", ".join(inline_table(wheel) for wheel in wheels) + "]\n"
+    lock = input_file.parent / "environment/uv.lock"
+    lock.write_bytes(lock.read_bytes() + package.encode())
+
+
+def write_local_wheel(
+    input_file, *, name="factor-abcd", locked_name=None, version="1.2.3", source="path",
+    lock_hash=True,
+):
+    run_directory = input_file.parent
+    wheel_directory = run_directory / "wheels"
+    wheel_directory.mkdir(exist_ok=True)
+    module = name.replace("-", "_")
+    filename = f"{module}-{version}-py3-none-any.whl"
+    wheel = wheel_directory / filename
+    metadata = f"{module}-{version}.dist-info"
+    with zipfile.ZipFile(wheel, "w") as archive:
+        archive.writestr(f"{module}/__init__.py", "FROZEN = True\n")
+        archive.writestr(
+            f"{metadata}/METADATA", f"Metadata-Version: 2.1\nName: {name}\nVersion: {version}\n",
+        )
+        archive.writestr(
+            f"{metadata}/WHEEL", "Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: py3-none-any\n",
+        )
+        archive.writestr(f"{metadata}/RECORD", "")
+    artifact = {
+        "package": name, "version": version,
+        "sha256": hashlib.sha256(wheel.read_bytes()).hexdigest(),
+        "wheel": wheel.relative_to(run_directory).as_posix(),
+    }
+    if name == "scheme":
+        lock = run_directory / "environment/uv.lock"
+        lock.write_bytes(lock.read_bytes().split(b"[[package]]")[0])
+    relative = f"../wheels/{filename}"
+    wheel_metadata = {"filename": filename}
+    if source in {"path", "path-absolute"}:
+        lock_source = {"path": relative if source == "path" else str(wheel)}
+    else:
+        registry = {
+            "registry-path": "../wheels", "registry-url": "../wheels",
+            "registry-absolute": str(wheel_directory), "registry-uri": wheel_directory.as_uri(),
+            "registry-wheel-uri": "../wheels",
+        }[source]
+        lock_source = {"registry": registry}
+        wheel_metadata = (
+            {"url": relative} if source == "registry-url"
+            else {"url": wheel.as_uri()} if source == "registry-wheel-uri"
+            else {"path": filename}
+        )
+    if lock_hash:
+        wheel_metadata["hash"] = "sha256:" + artifact["sha256"]
+    add_lock_package(
+        input_file, name=locked_name or name, version=version, source=lock_source,
+        wheels=[wheel_metadata],
+    )
+    return artifact
+
+
+@pytest.fixture
+def local_artifact(input_file):
+    return write_local_wheel(input_file)
+
+
+def mock_task_processes(
+    calls, input_file, *, events=None, after_sync=None, after_run=None, returncodes=(0, 0),
+):
     project = input_file.parent / "environment"
     input_sha256 = hashlib.sha256(input_file.read_bytes()).hexdigest()
     lock_sha256 = hashlib.sha256((project / "uv.lock").read_bytes()).hexdigest()
@@ -89,6 +171,8 @@ def mock_task_processes(calls, input_file, *, events=None, after_run=None, retur
             entry = project / ".venv" / ("Scripts/scheme.exe" if os.name == "nt" else "bin/scheme")
             entry.parent.mkdir(parents=True)
             entry.touch()
+            if after_sync is not None:
+                after_sync(project)
         else:
             output = input_file.parent / "report"
             output.mkdir()
@@ -137,6 +221,8 @@ def test_admission_precedes_unchanged_locked_flow(
     )
     for key in inherited_keys:
         monkeypatch.setenv(key, "worker-setting")
+    monkeypatch.setenv("UV_LINK_MODE", "copy")
+    monkeypatch.setenv("UV_CACHE_DIR", "/cache/on/another/filesystem")
 
     assert main(["apps", kind, "--input-file", str(input_file)]) == 0
     assert events == ["admission", "sync", "run"]
@@ -166,6 +252,8 @@ def test_admission_precedes_unchanged_locked_flow(
     for call in (sync, run):
         assert call.kwargs["cwd"] == project
         assert call.kwargs["env"]["UV_PROJECT_ENVIRONMENT"] == str(project / ".venv")
+        assert call.kwargs["env"]["UV_LINK_MODE"] == "hardlink"
+        assert call.kwargs["env"]["UV_CACHE_DIR"] == str(input_file.parent.parent / ".uv-cache")
         assert all(key not in call.kwargs["env"] for key in inherited_keys)
     assert all(os.environ[key] == "worker-setting" for key in inherited_keys)
     assert input_file.read_bytes() == source
@@ -479,3 +567,459 @@ def test_output_checks_still_enforced_after_admission(invalid, input_file, exter
     mock_task_processes(external_calls, input_file, after_run=corrupt_output)
     with pytest.raises(ValueError):
         task.run_task(input_file, kind="factor")
+
+
+@pytest.mark.parametrize("kind", KINDS)
+@pytest.mark.parametrize("grandfathered", [False, True])
+def test_frozen_research_wheel_uses_accepted_snapshot_without_source_projects(
+    kind, grandfathered, tmp_path, external_calls, monkeypatch,
+):
+    input_file = write_run(tmp_path / "runs" / str(uuid4()), kind=kind)
+    artifact = write_local_wheel(input_file, name=f"{kind}-abcd")
+    source_project = tmp_path / "source-projects" / artifact["package"]
+    source_project.mkdir(parents=True)
+    (source_project / "pyproject.toml").write_text("source project is not a runtime dependency")
+    shutil.rmtree(source_project.parent)
+    before = input_file.read_bytes(), (input_file.parent / "environment/uv.lock").read_bytes()
+    response = respond(external_calls, artifact_response([artifact], grandfathered=grandfathered))
+    events = []
+
+    def admit(request, *, timeout):
+        events.append("admission")
+        return response
+
+    original_import = builtins.__import__
+
+    def no_scheme_import(name, *args, **kwargs):
+        if name == "scheme" or name.startswith("scheme."):
+            raise AssertionError("Runtime must not import Scheme")
+        return original_import(name, *args, **kwargs)
+
+    external_calls.open.side_effect = admit
+    monkeypatch.setattr(builtins, "__import__", no_scheme_import)
+    hashes = []
+    original_hash = task.file_hash
+
+    def observe_hash(path):
+        if path == input_file.parent / artifact["wheel"]:
+            hashes.append(tuple(events))
+        return original_hash(path)
+
+    monkeypatch.setattr(task, "file_hash", observe_hash)
+    mock_task_processes(external_calls, input_file, events=events)
+    assert task.run_task(input_file, kind=kind) == 0
+    assert events == ["admission", "sync", "run"]
+    assert hashes == [("admission",), ("admission", "sync"), ("admission", "sync", "run")]
+    external_calls.open.assert_called_once()
+    assert input_file.read_bytes() == before[0]
+    assert (input_file.parent / "environment/uv.lock").read_bytes() == before[1]
+    assert not source_project.exists()
+
+
+@pytest.mark.parametrize("source", [
+    "path", "path-absolute", "registry-path", "registry-url", "registry-absolute",
+    "registry-uri", "registry-wheel-uri",
+])
+@pytest.mark.parametrize("lock_hash", [False, True])
+def test_local_lock_source_forms_match_origin_free_snapshot(
+    source, lock_hash, input_file, external_calls,
+):
+    artifact = write_local_wheel(input_file, source=source, lock_hash=lock_hash)
+    respond(external_calls, artifact_response([artifact]))
+    mock_task_processes(external_calls, input_file)
+    assert task.run_task(input_file, kind="factor") == 0
+    external_calls.open.assert_called_once()
+    assert external_calls.process.call_count == 2
+
+
+@pytest.mark.parametrize("name", ["scheme", "helper-lib"])
+def test_local_nonresearch_and_scheme_wheels_require_artifacts(name, input_file, external_calls):
+    artifact = write_local_wheel(input_file, name=name, source="registry-path")
+    respond(external_calls, artifact_response([artifact]))
+    mock_task_processes(external_calls, input_file)
+    assert task.run_task(input_file, kind="factor") == 0
+
+
+def test_every_local_wheel_must_be_in_exact_snapshot(input_file, external_calls):
+    artifacts = [
+        write_local_wheel(input_file, name="scheme", source="registry-path"),
+        write_local_wheel(input_file),
+        write_local_wheel(input_file, name="helper-lib", source="registry-path"),
+    ]
+    respond(external_calls, artifact_response(list(reversed(artifacts))))
+    mock_task_processes(external_calls, input_file)
+    assert task.run_task(input_file, kind="factor") == 0
+    external_calls.open.assert_called_once()
+
+
+@pytest.mark.parametrize("body", [ALLOWED, artifact_response([])])
+@pytest.mark.parametrize("name", ["factor-abcd", "helper-lib", "scheme"])
+def test_local_lock_missing_snapshot_denies_before_sync(body, name, input_file, external_calls):
+    write_local_wheel(input_file, name=name)
+    respond(external_calls, body)
+    with pytest.raises(ValueError, match="接受快照缺失"):
+        task.run_task(input_file, kind="factor")
+    external_calls.open.assert_called_once()
+    assert_not_started(external_calls, input_file)
+
+
+@pytest.mark.parametrize("body", [ALLOWED, artifact_response([])])
+def test_pure_registry_lock_accepts_legacy_or_empty_manifest(body, input_file, external_calls):
+    respond(external_calls, body)
+    mock_task_processes(external_calls, input_file)
+    assert task.run_task(input_file, kind="factor") == 0
+    external_calls.open.assert_called_once()
+
+
+@pytest.mark.parametrize("kind", KINDS)
+def test_research_registry_package_cannot_bypass_local_snapshot(kind, input_file, external_calls):
+    add_lock_package(
+        input_file, name=f"{kind}-abcd", version="1.2.3",
+        source={"registry": "https://pypi.org/simple"},
+    )
+    respond(external_calls, artifact_response([]))
+    with pytest.raises(ValueError, match="研究包必须"):
+        task.run_task(input_file, kind="factor")
+    assert_not_started(external_calls, input_file)
+
+
+@pytest.mark.parametrize("phase", ["before-admission", "admission", "sync", "run"])
+@pytest.mark.parametrize("mutation", ["tamper", "remove"])
+def test_local_wheel_tamper_is_detected_at_each_boundary(
+    phase, mutation, local_artifact, input_file, external_calls,
+):
+    wheel = input_file.parent / local_artifact["wheel"]
+    response = respond(external_calls, artifact_response([local_artifact]))
+
+    def change(*args):
+        if mutation == "tamper":
+            wheel.write_bytes(wheel.read_bytes() + b"changed after accepted snapshot")
+        else:
+            wheel.unlink()
+
+    if phase == "before-admission":
+        change()
+    elif phase == "admission":
+        def admit(request, *, timeout):
+            change()
+            return response
+        external_calls.open.side_effect = admit
+    mock_task_processes(
+        external_calls, input_file,
+        after_sync=change if phase == "sync" else None,
+        after_run=change if phase == "run" else None,
+    )
+    with pytest.raises(ValueError, match="wheel"):
+        task.run_task(input_file, kind="factor")
+    external_calls.open.assert_called_once()
+    assert external_calls.process.call_count == {"before-admission": 0, "admission": 0, "sync": 1, "run": 2}[phase]
+    if phase in {"before-admission", "admission"}:
+        assert_not_started(external_calls, input_file)
+    if phase == "sync":
+        assert not (input_file.parent / "report").exists()
+
+
+@pytest.mark.parametrize("filename", ["input.json", "environment/uv.lock"])
+def test_sync_time_input_or_lock_change_prevents_execution(filename, input_file, external_calls):
+    respond(external_calls)
+
+    def change(project):
+        path = input_file.parent / filename
+        path.write_bytes(path.read_bytes() + b" ")
+
+    mock_task_processes(external_calls, input_file, after_sync=change)
+    with pytest.raises(ValueError, match="同步期间.*发生变化"):
+        task.run_task(input_file, kind="factor")
+    assert external_calls.process.call_count == 1
+    assert not (input_file.parent / "report").exists()
+
+
+@pytest.mark.parametrize("value", [None, False, 1, "", {}, [None], [1], [[]], ["wheel"]])
+def test_artifact_manifest_types_are_strict(value, input_file, external_calls):
+    respond(external_calls, artifact_response(value))
+    with pytest.raises(RuntimeError, match="准入响应无效"):
+        task.run_task(input_file, kind="factor")
+    assert_not_started(external_calls, input_file)
+
+
+@pytest.mark.parametrize("invalid", [
+    "missing-package", "missing-version", "missing-sha256", "missing-wheel", "extra-field",
+    "name-upper", "name-underscore", "name-dot", "name-repeated-hyphen", "name-empty",
+    "name-leading-hyphen", "name-long", "name-type", "version-empty", "version-type",
+    "version-long", "version-control", "hash-short", "hash-nonhex", "hash-prefix", "hash-type",
+    "path-absolute", "path-drive", "path-unc", "path-escape", "path-nested-escape",
+    "path-dot", "path-double-slash", "path-backslash", "path-url", "path-control",
+    "path-suffix", "path-long", "path-empty", "path-type", "path-ads", "path-trailing-dot",
+    "path-trailing-space", "duplicate-name", "duplicate-path", "too-many",
+])
+def test_invalid_or_unbounded_artifact_snapshot_never_starts(
+    invalid, local_artifact, input_file, external_calls,
+):
+    artifact = dict(local_artifact)
+    manifest = [artifact]
+    if invalid.startswith("missing-"):
+        del artifact[invalid.removeprefix("missing-")]
+    elif invalid == "extra-field":
+        artifact["origin"] = "not part of the runtime identity"
+    elif invalid == "duplicate-name":
+        manifest.append(dict(artifact, version="2.0", wheel="wheels/other-2.0-py3-none-any.whl"))
+    elif invalid == "duplicate-path":
+        manifest.append(dict(artifact, package="other-package"))
+    elif invalid == "too-many":
+        manifest = [dict(artifact, package=f"pkg-{index}", wheel=f"wheels/{index}.whl") for index in range(257)]
+        assert len(artifact_response(manifest)) < 64 * 1024
+    else:
+        field, value = {
+            "name-upper": ("package", "Factor-abcd"),
+            "name-underscore": ("package", "factor_abcd"),
+            "name-dot": ("package", "factor.abcd"),
+            "name-repeated-hyphen": ("package", "factor--abcd"),
+            "name-empty": ("package", ""), "name-leading-hyphen": ("package", "-factor-abcd"),
+            "name-long": ("package", "x" * 201), "name-type": ("package", 1),
+            "version-empty": ("version", ""), "version-type": ("version", 1),
+            "version-long": ("version", "1" * 129), "version-control": ("version", "1.0\n"),
+            "hash-short": ("sha256", "a" * 63), "hash-nonhex": ("sha256", "g" * 64),
+            "hash-prefix": ("sha256", "sha256:" + "a" * 64), "hash-type": ("sha256", 1),
+            "path-absolute": ("wheel", "/wheels/factor.whl"),
+            "path-drive": ("wheel", "C:/wheels/factor.whl"),
+            "path-unc": ("wheel", "//server/wheels/factor.whl"),
+            "path-escape": ("wheel", "../factor.whl"),
+            "path-nested-escape": ("wheel", "wheels/../factor.whl"),
+            "path-dot": ("wheel", "./wheels/factor.whl"),
+            "path-double-slash": ("wheel", "wheels//factor.whl"),
+            "path-backslash": ("wheel", "wheels\\factor.whl"),
+            "path-url": ("wheel", "file:///wheels/factor.whl"),
+            "path-control": ("wheel", "wheels/\x00factor.whl"),
+            "path-suffix": ("wheel", "wheels/factor.zip"),
+            "path-long": ("wheel", "wheels/" + "x" * 1024 + ".whl"),
+            "path-empty": ("wheel", ""), "path-type": ("wheel", 1),
+            "path-ads": ("wheel", "wheels/factor:payload.whl"),
+            "path-trailing-dot": ("wheel", "wheels./factor.whl"),
+            "path-trailing-space": ("wheel", "wheels /factor.whl"),
+        }[invalid]
+        artifact[field] = value
+    respond(external_calls, artifact_response(manifest))
+    with pytest.raises(RuntimeError, match="准入响应无效"):
+        task.run_task(input_file, kind="factor")
+    assert_not_started(external_calls, input_file)
+
+
+@pytest.mark.parametrize("invalid", ["package", "version", "digest", "path", "extra-artifact"])
+def test_well_formed_snapshot_conflicts_with_lock_are_denied(
+    invalid, local_artifact, input_file, external_calls,
+):
+    artifact = dict(local_artifact)
+    if invalid == "package":
+        artifact["package"] = "unaccepted-package"
+    elif invalid == "version":
+        artifact["version"] = "9.9.9"
+    elif invalid == "digest":
+        artifact["sha256"] = "0" * 64
+    elif invalid == "path":
+        other = input_file.parent / "wheels/other.whl"
+        other.write_bytes((input_file.parent / artifact["wheel"]).read_bytes())
+        artifact["wheel"] = other.relative_to(input_file.parent).as_posix()
+    manifest = [artifact]
+    if invalid == "extra-artifact":
+        manifest.append(dict(artifact, package="unaccepted-package", wheel="wheels/extra.whl"))
+    respond(external_calls, artifact_response(manifest))
+    with pytest.raises(ValueError, match="接受快照"):
+        task.run_task(input_file, kind="factor")
+    assert_not_started(external_calls, input_file)
+
+
+@pytest.mark.parametrize("conflict", ["local-alias", "remote-alias", "shared-path"])
+def test_lock_local_package_identities_and_paths_are_unique(
+    conflict, input_file, external_calls,
+):
+    artifact = write_local_wheel(input_file, name="helper-lib")
+    source = (
+        {"registry": "https://pypi.org/simple"} if conflict == "remote-alias"
+        else {"path": "../" + artifact["wheel"]}
+    )
+    add_lock_package(
+        input_file, name="other-lib" if conflict == "shared-path" else "Helper_Lib",
+        version="1.2.3", source=source,
+    )
+    respond(external_calls, artifact_response([artifact]))
+    with pytest.raises(ValueError, match="身份.*冲突|路径冲突"):
+        task.run_task(input_file, kind="factor")
+    assert_not_started(external_calls, input_file)
+
+
+@pytest.mark.parametrize("phase", ["admission", "sync", "run"])
+def test_local_wheel_symlink_escape_fails_at_every_boundary(
+    phase, local_artifact, input_file, external_calls, tmp_path,
+):
+    wheel = input_file.parent / local_artifact["wheel"]
+    outside = tmp_path / "other-run" / wheel.name
+    outside.parent.mkdir()
+    outside.write_bytes(wheel.read_bytes())
+    probe = input_file.parent / "symlink-probe"
+    try:
+        probe.symlink_to(outside)
+    except (OSError, NotImplementedError):
+        pytest.skip("File symlinks are unavailable on this host")
+    probe.unlink()
+
+    def escape(*args):
+        wheel.unlink()
+        wheel.symlink_to(outside)
+
+    response = respond(external_calls, artifact_response([local_artifact]))
+    if phase == "admission":
+        def admit(request, *, timeout):
+            escape()
+            return response
+        external_calls.open.side_effect = admit
+    mock_task_processes(
+        external_calls, input_file,
+        after_sync=escape if phase == "sync" else None,
+        after_run=escape if phase == "run" else None,
+    )
+    with pytest.raises(ValueError, match="符号链接必须位于"):
+        task.run_task(input_file, kind="factor")
+    assert external_calls.process.call_count == {"admission": 0, "sync": 1, "run": 2}[phase]
+
+
+@pytest.mark.parametrize("source", ["path", "registry"])
+def test_lock_cannot_read_other_run_wheels_even_with_matching_digest(
+    source, input_file, external_calls, tmp_path,
+):
+    other_input = write_run(tmp_path / "runs" / str(uuid4()))
+    artifact = write_local_wheel(other_input)
+    wheel = other_input.parent / artifact["wheel"]
+    add_lock_package(
+        input_file, name=artifact["package"], version=artifact["version"],
+        source={source: str(wheel if source == "path" else wheel.parent)},
+        wheels=[{"path": wheel.name, "hash": "sha256:" + artifact["sha256"]}],
+    )
+    respond(external_calls, artifact_response([artifact]))
+    with pytest.raises(ValueError, match="必须位于本次 Run 内"):
+        task.run_task(input_file, kind="factor")
+    assert_not_started(external_calls, input_file)
+
+
+@pytest.mark.parametrize("body", [
+    b'{"allowed":true,"allowed":false,"grandfathered":false}',
+    b'{"allowed":true,"grandfathered":false,"artifacts":[],"artifacts":[]}',
+    b'{"allowed":true,"grandfathered":false,"artifacts":[{"package":"a","package":"b"}]}',
+    b'{"allowed":true,"grandfathered":false,"artifacts":' + b"[" * 2000 + b"]" * 2000 + b"}",
+])
+def test_ambiguous_or_deep_json_admission_is_denied(body, input_file, external_calls):
+    respond(external_calls, body)
+    with pytest.raises(RuntimeError, match="准入响应无效"):
+        task.run_task(input_file, kind="factor")
+    assert_not_started(external_calls, input_file)
+
+
+def test_check_task_admission_returns_validated_manifest(local_artifact, input_file, external_calls):
+    respond(external_calls, artifact_response([local_artifact]))
+    assert task._check_task_admission(
+        uuid4(), kind="factor", input_sha256="1" * 64, lock_sha256="2" * 64,
+    ) == [local_artifact]
+    external_calls.open.assert_called_once()
+
+
+def test_hex_digest_case_and_canonical_lock_name_match(input_file, external_calls):
+    artifact = write_local_wheel(input_file, locked_name="Factor_abcd")
+    respond(external_calls, artifact_response([dict(artifact, sha256=artifact["sha256"].upper())]))
+    mock_task_processes(external_calls, input_file)
+    assert task.run_task(input_file, kind="factor") == 0
+
+
+@pytest.mark.parametrize("invalid", [
+    "no-wheels", "multiple-wheels", "ambiguous-path-url", "remote-wheel", "missing-reference",
+    "bad-hash", "wrong-hash",
+])
+def test_invalid_flat_registry_wheel_lock_fails_closed(invalid, input_file, external_calls):
+    artifact = write_local_wheel(input_file, name="helper-lib")
+    lock = input_file.parent / "environment/uv.lock"
+    lock.write_bytes(lock.read_bytes().rsplit(b"[[package]]", 1)[0])
+    wheel = input_file.parent / artifact["wheel"]
+    metadata = {"path": wheel.name, "hash": "sha256:" + artifact["sha256"]}
+    wheels = [metadata]
+    if invalid == "no-wheels":
+        wheels = []
+    elif invalid == "multiple-wheels":
+        wheels.append(dict(metadata, path="other.whl"))
+    elif invalid == "ambiguous-path-url":
+        metadata["url"] = "../" + artifact["wheel"]
+    elif invalid == "remote-wheel":
+        metadata = {"url": "https://registry.example/other.whl"}
+        wheels = [metadata]
+    elif invalid == "missing-reference":
+        del metadata["path"]
+    elif invalid == "bad-hash":
+        metadata["hash"] = "md5:0123"
+    elif invalid == "wrong-hash":
+        metadata["hash"] = "sha256:" + "0" * 64
+    add_lock_package(
+        input_file, name=artifact["package"], version=artifact["version"],
+        source={"registry": "../wheels"}, wheels=wheels,
+    )
+    respond(external_calls, artifact_response([artifact]))
+    with pytest.raises(ValueError):
+        task.run_task(input_file, kind="factor")
+    assert_not_started(external_calls, input_file)
+
+
+def test_source_path_without_wheels_uses_accepted_digest(input_file, external_calls):
+    artifact = write_local_wheel(input_file)
+    lock = input_file.parent / "environment/uv.lock"
+    lock.write_bytes(lock.read_bytes().rsplit(b"wheels =", 1)[0])
+    respond(external_calls, artifact_response([artifact]))
+    mock_task_processes(external_calls, input_file)
+    assert task.run_task(input_file, kind="factor") == 0
+
+
+@pytest.mark.parametrize("source", ["file-uri", "relative"])
+def test_unsupported_local_url_cannot_bypass_manifest(source, input_file, external_calls):
+    artifact = write_local_wheel(input_file, name="helper-lib")
+    lock = input_file.parent / "environment/uv.lock"
+    lock.write_bytes(lock.read_bytes().rsplit(b"[[package]]", 1)[0])
+    wheel = input_file.parent / artifact["wheel"]
+    add_lock_package(
+        input_file, name="helper-lib", version=artifact["version"],
+        source={"url": wheel.as_uri() if source == "file-uri" else "../" + artifact["wheel"]},
+    )
+    respond(external_calls, ALLOWED)
+    with pytest.raises(ValueError, match="本地 wheel"):
+        task.run_task(input_file, kind="factor")
+    assert_not_started(external_calls, input_file)
+
+
+@pytest.mark.parametrize("phase", ["admission", "sync", "run"])
+def test_symlink_escape_validation_without_host_symlink_privileges(
+    phase, local_artifact, input_file, external_calls, monkeypatch, tmp_path,
+):
+    wheel = input_file.parent / local_artifact["wheel"]
+    outside = tmp_path / "outside" / wheel.name
+    resolving_escape = False
+    original_resolve = Path.resolve
+
+    def resolve(path, *args, **kwargs):
+        if resolving_escape and path == wheel:
+            return outside
+        return original_resolve(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "resolve", resolve)
+
+    def escape(*args):
+        nonlocal resolving_escape
+        resolving_escape = True
+
+    response = respond(external_calls, artifact_response([local_artifact]))
+    if phase == "admission":
+        def admit(request, *, timeout):
+            escape()
+            return response
+        external_calls.open.side_effect = admit
+    mock_task_processes(
+        external_calls, input_file,
+        after_sync=escape if phase == "sync" else None,
+        after_run=escape if phase == "run" else None,
+    )
+    with pytest.raises(ValueError, match="符号链接必须位于"):
+        task.run_task(input_file, kind="factor")
+    assert external_calls.process.call_count == {"admission": 0, "sync": 1, "run": 2}[phase]
