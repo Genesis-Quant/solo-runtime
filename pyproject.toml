@@ -16,6 +16,10 @@ build-backend = "uv_build"
 [tool.uv.build-backend]
 module-name = "solo_runtime"
 
+[[tool.uv.index]]
+url = "https://pypi.tuna.tsinghua.edu.cn/simple"
+default = true
+
 [dependency-groups]
 dev = ["pytest>=8", "ruff>=0.16"]
 
