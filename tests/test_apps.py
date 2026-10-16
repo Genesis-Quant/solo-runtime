@@ -6,6 +6,7 @@ import pytest
 
 from solo_runtime.apps import control, execution, factor, model, optimize, strategy
 from solo_runtime.manage import main
+from solo_runtime.utils.task import TaskInputError
 
 APPLICATIONS = [("factor", factor), ("model", model), ("optimize", optimize),
                 ("control", control), ("execution", execution), ("strategy", strategy)]
@@ -48,3 +49,24 @@ def test_backtest_cannot_replace_task_kind(name, input_file, capsys):
     source.write_text('{"kind":"backtest","algos":{}}')
     assert main(["apps", name, "--input-file", str(source)]) == 1
     assert name in capsys.readouterr().err
+
+
+def test_input_error_is_reported_without_traceback(monkeypatch, input_file, capsys):
+    monkeypatch.setattr(factor, "run", Mock(side_effect=TaskInputError("任务输入不正确")))
+    assert main(["apps", "factor", "--input-file", str(input_file)]) == 1
+    assert capsys.readouterr().err == "TaskInputError: 任务输入不正确\n"
+
+
+@pytest.mark.parametrize("error", [
+    ValueError("unexpected value"), RuntimeError("task failed"),
+    KeyError("missing field"), FileNotFoundError("missing file"),
+])
+def test_unexpected_errors_keep_traceback(error, monkeypatch, input_file, capsys):
+    monkeypatch.setattr(factor, "run", Mock(side_effect=error))
+    with pytest.raises(type(error)) as caught:
+        main(["apps", "factor", "--input-file", str(input_file)])
+    assert caught.value is error
+    assert "test_unexpected_errors_keep_traceback" in [
+        frame.name for frame in caught.traceback
+    ]
+    assert capsys.readouterr().err == ""

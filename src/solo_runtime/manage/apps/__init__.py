@@ -6,6 +6,7 @@ from collections.abc import Sequence
 from pathlib import Path
 
 from solo_runtime.apps import control, execution, factor, model, optimize, strategy
+from solo_runtime.utils.task import TaskInputError
 
 __all__ = ["main"]
 
@@ -21,6 +22,6 @@ def main(argv: Sequence[str] | None = None, *, prog: str = "solo-manage apps") -
     arguments = parser.parse_args(argv)
     try:
         return arguments.handler(arguments.input_file)
-    except Exception as error:
+    except TaskInputError as error:
         print(f"{type(error).__name__}: {error}", file=sys.stderr)
         return 1

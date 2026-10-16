@@ -33,8 +33,8 @@ Runtime 随后读取以下启动字段，其余内容原样交给研究进程：
 
 执行流程：
 
-1. 从 `input.json` 的父目录读取 Backend 管理的 Run UUID，计算原始输入和 `uv.lock` 的 SHA256；向 `POST /api/v1/version-policy/tasks/{UUID}/check` 提交 `kind` 与两个哈希，成功后再次检查文件未变化。
-2. 仅在中央准入允许后执行 `uv sync --project <environment> --locked --no-editable --no-dev`。退役、来源不明、未持久化接受哈希的任务、任意克隆的旧输入、请求与数据库/文件哈希不符或 Backend 不可用时在安装环境前失败；不从 `created_at` 或 `queued` 推断例外。
+1. 从 `input.json` 的父目录读取 Backend 管理的 Run UUID，向 `POST /api/v1/version-policy/tasks/{UUID}/check` 提交 `{"kind":"<任务类型>"}`，仅接受 HTTP 200 且 `allowed` 为 `true`。
+2. 仅在中央准入允许后执行 `uv sync --project <environment> --locked --no-editable --no-dev`。版本退役与历史任务准入由 Backend 裁决；HTTP 422 的 `detail.reason` 经脱敏后用于错误提示，其他拒绝或 Backend 不可用同样在安装环境前失败。
 3. 使用该环境的 `scheme run --input <input.json> --output <output>` 入口。不会退回使用 Worker 全局安装的命令。
 4. 子进程标准输出、标准错误直接交给 DolphinScheduler；安装失败和研究失败均返回非零退出码。
 5. 子进程成功退出后，核验 `run.json` 和它引用的所有报告文件。
@@ -47,13 +47,10 @@ Runtime 1.1.0 新增中央执行准入，完成协议仍为 1。通过 `SOLO_BAC
 |---|---|
 | protocol | 固定为 1，与 scheme 包版本无关 |
 | status | 成功时为 success |
-| input_sha256 | 原始 input.json 文件的 SHA256 |
-| lock_sha256 | 任务 uv.lock 的 SHA256 |
 | input.kind | 本次任务类型，与 app 和工作流同名 |
 | report_kind | 实际报告类型，由 Scheme 结果对象给出 |
 | reports | 报告名称到输出目录内相对文件名的映射 |
-| report_sha256 | 文件名到文件 SHA256 的映射 |
 
-scheme 在所有报告保存完成后原子写入 `run.json`。缺少清单、缺失文件、哈希不符或文件越出输出目录都视为失败；已有完成清单的目录禁止重跑覆盖。清单可额外包含研究参数、实际包版本等信息，Runtime 不解释这些字段，也不规定具体报告表结构。
+scheme 在所有报告保存完成后原子写入 `run.json`。Runtime 只检查协议为 1、状态为 success，以及 `reports` 声明的文件存在；已有完成清单的目录禁止重跑覆盖。清单可额外包含研究参数、实际包版本等信息，Runtime 不解释这些字段，也不规定具体报告表结构。任务组件字段为 `package`、`version`、`wheel`、`entry`，因子另有 `params`。输入、锁文件、wheel 和报告均不进行文件哈希或内容摘要比对。
 
 同一 Runtime 可以启动不同 scheme 主版本的任务，前提是它们实现相同 CLI 和完成清单协议。更改此进程边界协议才需要调整 Runtime。Jupyter 的研究 SDK 位于 `scheme.base`、`scheme.execute`、`scheme.data`，详见 [scheme README](https://gitee.com/genesis-quant/solo-algo-scheme#readme)。
