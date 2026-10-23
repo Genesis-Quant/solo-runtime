@@ -114,7 +114,7 @@ def run_task(input_file: Path, *, kind: str) -> int:
         raise TaskInputError("正式任务不能依赖可变源码目录，请先构建 wheel 再锁定")
     _check_task_admission(run_id, kind=kind)
     env = dict(os.environ, UV_PROJECT_ENVIRONMENT=str(project / ".venv"),
-               UV_CACHE_DIR=str(input_file.parent.parent / ".uv-cache"), UV_LINK_MODE="hardlink")
+               UV_LINK_MODE=os.environ.get("UV_LINK_MODE") or "hardlink")
     # Worker 的全局镜像设置不能覆盖任务锁文件所使用的索引。
     for key in ("VIRTUAL_ENV", "PYTHONPATH", "PYTHONHOME", "UV_DEFAULT_INDEX", "UV_INDEX_URL", "UV_INDEX", "UV_EXTRA_INDEX_URL"):
         env.pop(key, None)
